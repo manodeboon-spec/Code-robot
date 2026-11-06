@@ -1,0 +1,248 @@
+โค้ดด้านล่างถูกปรับปรุงหน้าเว็บ HTML ให้ทำงานแบบ Dual Joystick โดยแบ่งเป็นจอยซ้ายสำหรับเดินหน้า/ถอยหลัง และจอยขวาสำหรับเลี้ยวซ้าย/ขวา เพื่อให้ได้ความรู้สึกในการควบคุมที่คล้ายกับจอยสเตชันในภาพ shopping.webp และรองรับระบบ Multi-touch (สัมผัสพร้อมกัน 2 นิ้ว) บนหน้าจอสมาร์ทโฟนได้ครับ
+แนะนำให้ หมุนโทรศัพท์เป็นแนวนอน (Landscape) เพื่อให้การควบคุมถนัดที่สุด
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+// ตั้งค่าชื่อ WiFi และรหัสผ่านที่บอร์ดจะปล่อยออกมา
+const char* ssid = "Mecanum_Robot"; 
+const char* password = "password123"; 
+
+ESP8266WebServer server(80);
+
+// ชุดมอเตอร์ 1 และ 2 (L298N ตัวที่ 1)
+#define motor1Pin1 D5
+#define motor1Pin2 D6
+#define motor2Pin1 D7
+#define motor2Pin2 D8
+
+// ชุดมอเตอร์ 3 และ 4 (L298N ตัวที่ 2)
+#define motor3Pin1 D1
+#define motor3Pin2 D2
+#define motor4Pin1 D3
+#define motor4Pin2 D4
+
+// หน้าเว็บ HTML พร้อม Dual Joystick (รองรับ Multi-touch)
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Dual Joystick RC</title>
+  <style>
+    body { 
+      margin: 0; padding: 0; background-color: #2c3e50; color: white; 
+      display: flex; flex-direction: column; justify-content: center; align-items: center; 
+      height: 100vh; overflow: hidden; font-family: sans-serif; user-select: none;
+    }
+    .gamepad {
+      display: flex; flex-direction: row; justify-content: space-between; align-items: center;
+      width: 90%; max-width: 600px;
+    }
+    .stick-container { display: flex; flex-direction: column; align-items: center; }
+    canvas { background-color: #34495e; border-radius: 50%; box-shadow: 0 4px 8px rgba(0,0,0,0.5); }
+    h1 { font-size: 20px; margin-bottom: 20px; }
+    p { font-size: 12px; color: #bdc3c7; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>RC Robot Control</h1>
+  <div class="gamepad">
+    <div class="stick-container">
+      <canvas id="joyLeft" width="160" height="160"></canvas>
+      <p>เดินหน้า / ถอยหลัง</p>
+    </div>
+    <div class="stick-container">
+      <canvas id="joyRight" width="160" height="160"></canvas>
+      <p>เลี้ยวซ้าย / ขวา</p>
+    </div>
+  </div>
+
+  <script>
+    const leftJoy = { id: 'joyLeft', state: 'S', x: 80, y: 80 };
+    const rightJoy = { id: 'joyRight', state: 'S', x: 80, y: 80 };
+    let currentCmd = 'S';
+
+    function drawJoy(joy, touchX, touchY) {
+      const canvas = document.getElementById(joy.id);
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // วาดฐาน
+      ctx.beginPath(); ctx.arc(80, 80, 80, 0, Math.PI*2); ctx.fillStyle = '#7f8c8d'; ctx.fill();
+      // วาดปุ่ม
+      ctx.beginPath(); ctx.arc(touchX, touchY, 35, 0, Math.PI*2); ctx.fillStyle = '#e74c3c'; ctx.fill();
+    }
+
+    function updateCommand() {
+      let newCmd = 'S';
+      // ให้ความสำคัญกับการเลี้ยวก่อน หากไม่ได้เลี้ยว ค่อยเช็กว่าเดินหน้า/ถอยหลังหรือไม่
+      if (rightJoy.state !== 'S') {
+        newCmd = rightJoy.state;
+      } else if (leftJoy.state !== 'S') {
+        newCmd = leftJoy.state;
+      }
+      
+      if (newCmd !== currentCmd) {
+        currentCmd = newCmd;
+        fetch('/cmd?dir=' + currentCmd);
+      }
+    }
+
+    function handleTouch(e, joy, isLeft) {
+      e.preventDefault();
+      const canvas = document.getElementById(joy.id);
+      const rect = canvas.getBoundingClientRect();
+      let touch = null;
+      
+      // ค้นหานิ้วที่สัมผัสอยู่บน canvas ตัวนี้
+      for(let i=0; i<e.targetTouches.length; i++) {
+        if(e.targetTouches[i].target === canvas) {
+          touch = e.targetTouches[i]; 
+          break;
+        }
+      }
+      
+      if(!touch) {
+        joy.state = 'S';
+        drawJoy(joy, 80, 80);
+        updateCommand();
+        return;
+      }
+
+      let tx = touch.clientX - rect.left;
+      let ty = touch.clientY - rect.top;
+      let dx = tx - 80;
+      let dy = ty - 80;
+      let dist = Math.sqrt(dx*dx + dy*dy);
+      
+      // ล็อกปุ่มให้อยู่ในวงกลม
+      if (dist > 80) {
+        tx = 80 + (dx / dist) * 80;
+        ty = 80 + (dy / dist) * 80;
+      }
+      drawJoy(joy, tx, ty);
+
+      // คำนวณคำสั่ง
+      if (dist > 25) {
+        if (isLeft) {
+          // จอยซ้าย: ใช้เฉพาะแกน Y (ขึ้น-ลง)
+          joy.state = dy > 0 ? 'B' : 'F';
+        } else {
+          // จอยขวา: ใช้เฉพาะแกน X (ซ้าย-ขวา)
+          joy.state = dx > 0 ? 'R' : 'L';
+        }
+      } else {
+        joy.state = 'S';
+      }
+      updateCommand();
+    }
+
+    function handleEnd(e, joy) {
+      e.preventDefault();
+      // เช็กว่ายังมีนิ้วสัมผัสที่ canvas นี้อยู่หรือไม่
+      const canvas = document.getElementById(joy.id);
+      let stillTouching = false;
+      for(let i=0; i<e.targetTouches.length; i++) {
+        if(e.targetTouches[i].target === canvas) stillTouching = true;
+      }
+      if (!stillTouching) {
+        joy.state = 'S';
+        drawJoy(joy, 80, 80);
+        updateCommand();
+      }
+    }
+
+    // สมัครรับ Event การสัมผัสสำหรับจอยทั้ง 2 ตัว
+    const leftCanvas = document.getElementById('joyLeft');
+    const rightCanvas = document.getElementById('joyRight');
+
+    leftCanvas.addEventListener('touchstart', e => handleTouch(e, leftJoy, true), {passive: false});
+    leftCanvas.addEventListener('touchmove', e => handleTouch(e, leftJoy, true), {passive: false});
+    leftCanvas.addEventListener('touchend', e => handleEnd(e, leftJoy), {passive: false});
+
+    rightCanvas.addEventListener('touchstart', e => handleTouch(e, rightJoy, false), {passive: false});
+    rightCanvas.addEventListener('touchmove', e => handleTouch(e, rightJoy, false), {passive: false});
+    rightCanvas.addEventListener('touchend', e => handleEnd(e, rightJoy), {passive: false});
+
+    // วาดเริ่มต้น
+    drawJoy(leftJoy, 80, 80);
+    drawJoy(rightJoy, 80, 80);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  // แก้ล้อกระตุกตอนเปิดเครื่อง
+  digitalWrite(motor1Pin1, LOW); digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, LOW); digitalWrite(motor2Pin2, LOW);
+  digitalWrite(motor3Pin1, LOW); digitalWrite(motor3Pin2, LOW);
+  digitalWrite(motor4Pin1, LOW); digitalWrite(motor4Pin2, LOW);
+
+  pinMode(motor1Pin1, OUTPUT); pinMode(motor1Pin2, OUTPUT);
+  pinMode(motor2Pin1, OUTPUT); pinMode(motor2Pin2, OUTPUT);
+  pinMode(motor3Pin1, OUTPUT); pinMode(motor3Pin2, OUTPUT);
+  pinMode(motor4Pin1, OUTPUT); pinMode(motor4Pin2, OUTPUT);
+  stopRobot();
+
+  // ตั้งค่า WiFi เป็น Access Point
+  WiFi.softAP(ssid, password);
+  
+  // รอรับ Request จากหน้าเว็บ
+  server.on("/", []() {
+    server.send(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/cmd", []() {
+    String dir = server.arg("dir");
+    if (dir == "F") moveForward();
+    else if (dir == "B") moveBackward();
+    else if (dir == "L") turnLeft();
+    else if (dir == "R") turnRight();
+    else if (dir == "S") stopRobot();
+    
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+// ฟังก์ชันเคลื่อนที่ 
+void moveForward() {
+  digitalWrite(motor1Pin1, HIGH); digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, HIGH); digitalWrite(motor2Pin2, LOW);
+  digitalWrite(motor3Pin1, HIGH); digitalWrite(motor3Pin2, LOW);
+  digitalWrite(motor4Pin1, HIGH); digitalWrite(motor4Pin2, LOW);
+}
+
+void moveBackward() {
+  digitalWrite(motor1Pin1, LOW); digitalWrite(motor1Pin2, HIGH);
+  digitalWrite(motor2Pin1, LOW); digitalWrite(motor2Pin2, HIGH);
+  digitalWrite(motor3Pin1, LOW); digitalWrite(motor3Pin2, HIGH);
+  digitalWrite(motor4Pin1, LOW); digitalWrite(motor4Pin2, HIGH);
+}
+
+void turnRight() {
+  digitalWrite(motor1Pin1, HIGH); digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, LOW); digitalWrite(motor2Pin2, HIGH);
+  digitalWrite(motor3Pin1, HIGH); digitalWrite(motor3Pin2, LOW);
+  digitalWrite(motor4Pin1, LOW); digitalWrite(motor4Pin2, HIGH);
+}
+
+void turnLeft() {
+  digitalWrite(motor1Pin1, LOW); digitalWrite(motor1Pin2, HIGH);
+  digitalWrite(motor2Pin1, HIGH); digitalWrite(motor2Pin2, LOW);
+  digitalWrite(motor3Pin1, LOW); digitalWrite(motor3Pin2, HIGH);
+  digitalWrite(motor4Pin1, HIGH); digitalWrite(motor4Pin2, LOW);
+}
+
+void stopRobot() {
+  digitalWrite(motor1Pin1, LOW); digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, LOW); digitalWrite(motor2Pin2, LOW);
+  digitalWrite(motor3Pin1, LOW); digitalWrite(motor3Pin2, LOW);
+  digitalWrite(motor4Pin1, LOW); digitalWrite(motor4Pin2, LOW);
+}
+
